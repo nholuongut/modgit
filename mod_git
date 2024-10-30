@@ -1,0 +1,694 @@
+#!/bin/bash
+
+VERSION="1.1.0"
+GITHUB="https://github.com/nholuongut/modgit"
+AUTHOR="Nho Luong"
+SCRIPT=${0##*/}
+IFS=$'\n'
+USAGE="\
+$(tput bold)modgit v$VERSION by $AUTHOR$(tput sgr0)
+Fork me at $GITHUB
+
+$(tput bold)Global Commands:$(tput sgr0)
+  $SCRIPT <command> [options]
+-----------------------------------------------------------------------------------
+  init                         Initialize .modgit/ folder
+  ls                           List installed modules
+  up-all                       Update all installed modules
+  rm-all                       Remove all installed modules
+
+Available options:
+  -n   Dry run mode (show what would be done)
+  -v   Show modgit version
+  -h   Show this help
+
+$(tput bold)Module Commands:$(tput sgr0)
+  $SCRIPT <command> [options] <module> [<repository>]
+-----------------------------------------------------------------------------------
+  add <module> <repository>    Install a module by cloning specified git repository
+  up <module>                  Update specified module
+  rm <module>                  Remove specified module
+  info <module>                Show information about a specific module
+  files <module>               List deployed files of specified module
+  proxy <module> <git_args>    Run git command into specified module
+
+Available options:
+  -n   Dry run mode (show what would be done)
+  -f   Force all files and folders to be deployed (ignore modman mapping file)
+  -i   Include filters (only for add command)
+       Example: $SCRIPT add $(tput bold)-i lib/ -i foo/:bar/$(tput sgr0) my_module https://github.com/account/repository.git
+                => will deploy only lib/ (to lib/) and foo/ (to bar/)
+  -e   Exclude filters (only for add command)
+       Example: $SCRIPT add $(tput bold)-e lib/tests/ -e lib/README.txt$(tput sgr0) my_module https://github.com/account/repository.git
+                => will exclude both directory lib/tests/ and file lib/README.txt
+  -b   Specify a repository branch (only for add command)
+       Example: $SCRIPT add $(tput bold)-b 1.0-stable$(tput sgr0) my_module https://github.com/account/repository.git
+                => will checkout 1.0-stable branch of specified repository
+  -t   Specify a repository tag (only for add and update command)
+       Example: $SCRIPT add $(tput bold)-t 1.2.0$(tput sgr0) my_module https://github.com/account/repository.git
+                => will checkout 1.2.0 tag of specified repository
+"
+
+# Case-insensitive for regex matching
+shopt -s nocasematch
+
+DRY_RUN=0
+IGNORE_MODMAN=0
+ACTION=""
+INCLUDES=""
+EXCLUDES="\
+readme.*
+about.*
+license.*
+copyright.*
+changelog.*
+credit.*
+faq.*
+\.travis.*
+\.git.*
+modman
+composer\.json"
+BRANCH="master"
+TAG=""
+
+# Echo in bold
+echo_b()
+{
+  if [ "$1" = "-e" ]; then
+    echo -e "$(tput bold)$2$(tput sgr0)"
+  else
+    echo "$(tput bold)$1$(tput sgr0)"
+  fi
+}
+
+show_help()
+{
+  echo -e "$USAGE"
+}
+
+# Fatal error
+fault()
+{
+  echo_b "-e" "ERROR: $1"
+  exit 1
+}
+
+add_include()
+{
+  if [ -z "$INCLUDES" ]; then
+    INCLUDES="$1"
+  else
+    INCLUDES="$INCLUDES\n$1"
+  fi
+}
+
+add_exclude()
+{
+  if [ -z "$EXCLUDES" ]; then
+    EXCLUDES="$1"
+  else
+    EXCLUDES="$EXCLUDES\n$1"
+  fi
+}
+
+# Show help if asked or if no argument specified
+if [ "$1" = "help" ] || [ -z "$1" ]; then
+  show_help
+  exit 0
+fi
+
+REGEX_ACTION="(list|info|files|ls|clone|add|update|up|update-all|up-all|remove|rm|remove-all|rm-all|proxy)"
+
+# Accept action as first argument
+if [[ "$1" =~ $REGEX_ACTION ]]; then
+  ACTION="$1"; shift
+fi
+
+# Handle options
+while getopts ":nvhfi:e:b:t:" opt; do
+  case $opt in
+    h)
+      show_help
+      exit 0
+      ;;
+    v)
+      echo_b "$SCRIPT v$VERSION by $AUTHOR"
+      echo "Fork me at $GITHUB"
+      exit 0
+      ;;
+    n)
+      DRY_RUN=1
+      shift $((OPTIND-1)); OPTIND=1
+      ;;
+    f)
+      IGNORE_MODMAN=1
+      shift $((OPTIND-1)); OPTIND=1
+      ;;
+    i)
+      add_include "$OPTARG"
+      shift $((OPTIND-1)); OPTIND=1
+      ;;
+    e)
+      add_exclude "$OPTARG"
+      shift $((OPTIND-1)); OPTIND=1
+      ;;
+    b)
+      BRANCH="$OPTARG"
+      shift $((OPTIND-1)); OPTIND=1
+      ;;
+    t)
+      TAG="$OPTARG"
+      shift $((OPTIND-1)); OPTIND=1
+      ;;
+    \?)
+      echo "Invalid option: -$OPTARG" >&2
+      exit 1
+      ;;
+    :)
+      echo "Option -$OPTARG requires an argument" >&2
+      exit 1
+      ;;
+  esac
+done
+
+# Initializes .modgit folder in root dir then quit
+if [ "$1" = "init" ]; then
+  [ -d ".modgit" ] && fault "$SCRIPT is already initialized"
+  mkdir .modgit || fault "Could not create .modgit directory"
+  echo_b "Initialized $SCRIPT at $(pwd)/.modgit/"
+  exit 0
+fi
+
+if [ $DRY_RUN -eq 1 ]; then
+  echo_b "DRY RUN MODE ON"
+  sleep 1
+fi
+
+# Checks if module dir exists or quit
+require_module_dir()
+{
+  [ -d "$MODGIT_DIR/$1" ] || fault "Module '$1' does not exist"
+
+  return 0
+}
+
+# Safe module removal
+remove_module_dir()
+{
+  local module="$1"
+  local module_dir="$MODGIT_DIR/$module"
+  if [ -n "$module" ] && [ -d "$module_dir" ]; then
+    rm -rf "$module_dir" 2>/dev/null
+  fi
+
+  return 0
+}
+
+# Deletes deployed files of specified module
+delete_files()
+{
+  local module="$1"
+  local module_dir="$MODGIT_DIR/$module"
+  local deployed_file="$module_dir/deployed.modgit"
+
+  [ $DRY_RUN -eq 1 ] && echo_b "Would remove files:" || echo_b "Removing files:"
+
+  for line in $(cat "$deployed_file" 2>/dev/null); do
+    if ! [ -z "$line" ] && [ -f "$ROOT/$line" ]; then
+      echo $line
+
+      # Remove deployed file and empty dirs
+      if [ $DRY_RUN -eq 0 ]; then
+        rm "$ROOT/$line" 2>/dev/null
+        prev_dir=""
+        dir=$(dirname $line)
+        while [ "$dir" != "$prev_dir" ]; do
+          prev_dir=$dir
+          test_dir="$ROOT/$dir"
+          if ! [ "$(ls -A $test_dir)" ]; then
+            rmdir $test_dir
+          fi
+          dir=${dir%/*}
+        done
+      fi
+    fi
+  done
+
+  return 0
+}
+
+# Removes specified module
+delete_module()
+{
+  local module="$1"
+  local module_dir="$MODGIT_DIR/$module"
+
+  require_module_dir "$module"
+
+  if [ $DRY_RUN -eq 0 ]; then
+    read -p "Are you sure you want to remove '$module' module? (y/n): " confirm
+    [ "$confirm" != "y" ] && [ "$confirm" != "" ] && echo "Aborting..." && return 0
+  fi
+
+  echo_b "Removing '$module' module..."
+  sleep 1
+
+  delete_files "$module" || return 1
+
+  [ $DRY_RUN -eq 1 ] && return 0
+
+  remove_module_dir "$module"
+
+  return $?
+}
+
+# Copies specified file to root directory
+deploy_file()
+{
+  local root_tmp="${ROOT//\//\\/}\\/"
+  echo $(echo "$2" | sed "s/^$root_tmp//g")
+
+  if [ $DRY_RUN -eq 0 ]; then
+    mkdir -p $(dirname $2) && cp "$1" "$2"
+  fi
+}
+
+# Synchronizes files from module dir to root dir, then store deployed files for easy remove
+move_files()
+{
+  local module="$1"
+  local module_dir="$MODGIT_DIR/$module"
+  local source_dir="$module_dir/source"
+  local includes_file="$module_dir/includes.modgit"
+  local excludes_file="$module_dir/excludes.modgit"
+  local modman_file="$source_dir/modman"
+  local deployed_file="$module_dir/deployed.modgit"
+
+  > "$deployed_file" # empty file
+
+  cd "$source_dir" || return 1
+
+  [ $DRY_RUN -eq 1 ] && echo_b "Would deploy:" || echo_b "Deploying:"
+
+  for file in $(find . -type f -not -iwholename '*.git*' | sed 's/^\.\///'); do
+    # Copy file by default
+    copy=1
+    target="$file"
+
+    # Include filters
+    if [ -s "$includes_file" ]; then
+      copy=0
+      for filter in $(cat "$includes_file"); do
+        src=$(echo $filter | cut -d: -f1)
+        if [ -z "$src" ]; then
+          continue
+        fi
+        if [[ "$file" =~ ^$src ]]; then
+          copy=1
+          # Handle optional different target
+          real=$(echo $filter | cut -d: -f2)
+          if [ "$src" != "$real" ]; then
+            tmp_src=$(echo $src | sed 's/^[\/]*//;s/[\/]*$//')
+            tmp_src="$tmp_src/"
+            tmp_src="${tmp_src//\//\\/}"
+            tmp_real=$(echo $real | sed 's/^[\/]*//;s/[\/]*$//')
+            tmp_real="$tmp_real/"
+            tmp_real="${tmp_real//\//\\/}"
+            target=$(echo $file | sed "s/$tmp_src/$tmp_real/g")
+          fi
+          break
+        fi
+      done
+    fi
+
+    # Exclude filters
+    if [ -s "$excludes_file" ] && [ $copy -eq 1 ]; then
+      for filter in $(cat "$excludes_file"); do
+        if [[ "$file" =~ ^$filter ]]; then
+          copy=0
+          break
+        fi
+      done
+    fi
+
+    if [ $copy -eq 1 ]; then
+      # Handle modman file
+      if [ $IGNORE_MODMAN -eq 0 ] && [ -s "$modman_file" ]; then
+        IFS=$'\n'
+        for line in $(cat "$modman_file"); do
+          if [ -z "$line" ] || [[ $line =~ ^# ]] || [[ $line =~ ^@ ]]; then
+            continue
+          fi
+          IFS=$' \t'
+          line="${line/\*/}" # remove * char
+          set -- $line       # set $1 and $2
+          if [[ "$file" =~ ^$1 ]]; then
+            # Remove trailing slashes and escape paths for sed
+            src=$(echo $1 | sed 's/^[\/]*//;s/[\/]*$//')
+            dest=$(echo $2 | sed 's/^[\/]*//;s/[\/]*$//')
+            src="${src//\//\\/}"
+            dest="${dest//\//\\/}"
+            target=$(echo $file | sed "s/$src/$dest/g")
+            deploy_file "$file" "$ROOT/$target"
+            echo "$target" >> "$deployed_file"
+          fi
+        done
+      else
+        deploy_file "$file" "$ROOT/$target"
+        echo "$target" >> "$deployed_file"
+      fi
+    fi
+  done
+
+  return 0
+}
+
+# Creates module dir, clones git repo and optionally stores include/exclude filters
+create_module()
+{
+  local repo="$1"
+  local module="$2"
+  local module_dir="$MODGIT_DIR/$module"; shift 2
+  local source_dir="$module_dir/source"
+
+  cd "$MODGIT_DIR"
+  echo_b "Cloning $repo..."
+  if ! git clone --quiet -- $repo "$source_dir"; then
+    remove_module_dir "$module"
+    fault "An error occurred while cloning repository"
+  fi
+
+  echo "$repo" > "$module_dir/repository.modgit"
+
+  cd "$source_dir"
+
+  # Ignore chmod changes in future
+  git config core.filemode false
+
+  if [ -n "$TAG" ]; then
+    if [ -z $(git tag -l "$TAG") ]; then
+      remove_module_dir "$module"
+      fault "Tag '$TAG' does not exist"
+    fi
+    if ! git checkout --quiet "$TAG"; then
+      remove_module_dir "$module"
+      fault "An error occurred while fetching tag $TAG"
+    fi
+    echo "$TAG" > "$module_dir/tag.modgit"
+  elif ! git checkout --quiet "$BRANCH"; then
+    remove_module_dir "$module"
+    fault "An error occurred while fetching branch $BRANCH"
+  fi
+
+  echo "$BRANCH" > "$module_dir/branch.modgit"
+
+  echo "Fetching submodules..."
+  if ! git submodule --quiet update --init --recursive; then
+    remove_module_dir "$module"
+    fault "An error occurred while cloning submodules of $repo"
+  fi
+
+  # Save includes filter if not empty
+  [ -z "$INCLUDES" ] || echo -e "$INCLUDES" > "$module_dir/includes.modgit"
+
+  # Save excludes filter if not empty
+  [ -z "$EXCLUDES" ] || echo -e "$EXCLUDES" > "$module_dir/excludes.modgit"
+
+  return 0
+}
+
+# Updates a module
+update_module()
+{
+  local module="$1"
+  local module_dir="$MODGIT_DIR/$module"
+  local source_dir="$module_dir/source"
+
+  require_module_dir "$module"
+
+  echo_b "Updating '$module' module..."
+  sleep 1
+
+  cd "$source_dir"
+
+  local old_commit=$(git rev-parse HEAD)
+
+  # If module was fetched with a specific tag
+  if [ -s "$module_dir/tag.modgit" ]; then
+    if [ -z "$TAG" ]; then
+      local repo_tag=$(cat "$module_dir/tag.modgit")
+      echo "'$module' module was fetched from tag '$repo_tag' and thus cannot be updated without -t option"
+      return 1
+    fi
+
+    if [ -z $(git tag -l "$TAG") ]; then
+      echo "Tag '$TAG' does not exist"
+      return 1
+    fi
+
+    if ! git checkout --quiet "$TAG"; then
+      echo "An error occurred while fetching tag $TAG"
+      return 1
+    fi
+
+    local old_tag=$(cat "$module_dir/tag.modgit")
+    echo "Switching from tag $old_tag to $TAG"
+
+    [ $DRY_RUN -eq 0 ] && echo "$TAG" > "$module_dir/tag.modgit"
+  else
+    # Ignoring -b option (switching branch) because not yet supported
+    [ -s "$module_dir/branch.modgit" ] && BRANCH=$(cat "$module_dir/branch.modgit")
+
+    git pull --quiet origin "$BRANCH" && git submodule --quiet update --init --recursive || return 1
+  fi
+
+  local new_commit=$(git rev-parse HEAD)
+  local count=$(git diff --shortstat "$old_commit" "$new_commit" | cut -d" " -f2)
+
+  [ $DRY_RUN -eq 1 ] && git checkout --quiet "$old_commit"
+
+  [ "$count" = "" ] && echo "No changes found" && return 0
+
+  if [ $DRY_RUN -eq 1 ]; then
+    echo_b "Would modify:"
+    git --no-pager diff --name-only "$old_commit" "$new_commit"
+    echo "$count file(s) changed"
+    return 0
+  fi
+
+  if delete_files "$module" &&
+    move_files "$module";
+  then
+    return 0
+  else
+    return 1
+  fi
+}
+
+module_info()
+{
+  local module="$1"
+  local module_dir="$MODGIT_DIR/$module"
+
+  require_module_dir "$module"
+
+  echo_b "Information about '$module' module:"
+  if [ -s "$module_dir/repository.modgit" ]; then
+    local repo=$(cat "$module_dir/repository.modgit")
+    echo "Repository: $repo"
+  fi
+
+  if [ -s "$module_dir/tag.modgit" ]; then
+    local current_tag=$(cat "$module_dir/tag.modgit")
+    echo "Tag: $current_tag"
+  else
+    local current_branch="master"
+    [ -s "$module_dir/branch.modgit" ] && current_branch=$(cat "$module_dir/branch.modgit")
+    echo "Branch: $current_branch"
+  fi
+
+  return 0
+}
+
+module_info_inline()
+{
+  local module="$1"
+  local module_dir="$MODGIT_DIR/$module"
+  local info=""
+
+  require_module_dir "$module"
+
+  if [ -s "$module_dir/repository.modgit" ]; then
+    local repo=$(cat "$module_dir/repository.modgit")
+    info="$info $repo"
+  fi
+
+  if [ -s "$module_dir/tag.modgit" ]; then
+    local current_tag=$(cat "$module_dir/tag.modgit")
+    info="$info (tag: $current_tag)"
+  else
+    local current_branch="master"
+    [ -s "$module_dir/branch.modgit" ] && current_branch=$(cat "$module_dir/branch.modgit")
+    info="$info (branch: $current_branch)"
+  fi
+
+  printf "$(tput bold)%-20s$(tput sgr0) $info\n" "$module"
+
+  return 0
+}
+
+require_modules()
+{
+  count=$(ls -A "$MODGIT_DIR" | wc -l | sed 's/ //g')
+  [ $count -eq 0 ] && fault "There is no module installed"
+}
+
+# Try to find .modgit dir
+ROOT=$(pwd -P)
+[ -d "$ROOT/.modgit" ] || fault "modgit directory not found\nRun '$SCRIPT init' in root folder of your project"
+
+# Path to .modgit
+MODGIT_DIR="$ROOT/.modgit"
+
+# Action is first argument
+if [ -z "$ACTION" ] && [[ "$1" =~ $REGEX_ACTION ]]; then
+  ACTION="$1"; shift
+fi
+
+[ -z "$ACTION" ] && show_help && fault "No action specified"
+
+# Handle action
+case "$ACTION" in
+
+  list|ls)
+    # List all installed modules
+    count=$(ls -A "$MODGIT_DIR" | wc -l | sed 's/ //g')
+    for module in $(ls -1 "$MODGIT_DIR"); do
+      [ -d "$MODGIT_DIR/$module" ] || continue;
+      module_info_inline "$module"
+    done
+    echo "$count module(s) found"
+    ;;
+
+  clone|add)
+    # Install new module
+    module="$1"; shift
+    [ -z "$module" ] && fault "No module specified"
+    module_dir="$MODGIT_DIR/$module"
+
+    [[ "$module" =~ [^a-z0-9_-]+ ]] &&
+      fault "You cannot add a module with a name not matching [^a-zA-Z0-9_-]+ pattern\nModule specified: $module"
+
+    [ -d "$module_dir" ] && fault "A module with this name already exists"
+
+    success=1
+    repo="$1"; shift
+    create_module "$repo" "$module" || success=0
+
+    cd "$MODGIT_DIR"
+
+    if [ $success -eq 1 ]; then
+      if require_module_dir "$module" &&
+        move_files "$module";
+      then
+        [ $DRY_RUN -eq 0 ] && echo_b "Installation complete" || remove_module_dir "$module"
+      fi
+    else
+      remove_module_dir "$module"
+      fault "Error cloning '$module', operation cancelled"
+    fi
+    ;;
+
+  update|up)
+    # Update specified module
+    module="$1"; shift
+    [ -z "$module" ] && fault "No module specified"
+
+    if ! update_module "$module"; then
+      fault "Error updating '$module', operation cancelled"
+    fi
+    ;;
+
+  update-all|up-all)
+    # Update all installed modules
+    [ -n "$1" ] && fault "Too many arguments for '$ACTION' command"
+
+    require_modules
+
+    errors=0
+    for module in $(ls -1 "$MODGIT_DIR"); do
+      [ -d "$MODGIT_DIR/$module" ] || continue;
+      if ! update_module "$module"; then
+        echo_b "-e" "Error occurred while updating '$module'"
+        errors=$((errors+1))
+      fi
+    done
+    [ $DRY_RUN -eq 0 ] && echo_b "Updated all modules with $errors error(s)"
+    ;;
+
+  remove|rm)
+    # Remove specified module
+    module="$1"; shift
+    [ -z "$module" ] && fault "No module specified"
+
+    if ! require_module_dir "$module" || ! delete_module "$module"; then
+      echo_b "Error removing '$module', operation cancelled"
+    fi
+    ;;
+
+  remove-all|rm-all)
+    # Remove all installed modules
+    [ -n "$1" ] && fault "Too many arguments for '$ACTION' command"
+
+    require_modules
+
+    errors=0
+    for module in $(ls -1 "$MODGIT_DIR"); do
+      [ -d "$MODGIT_DIR/$module" ] || continue
+      if ! delete_module "$module"; then
+        echo_b "-e" "Error occurred while removing '$module' module"
+        errors=$((errors+1))
+      fi
+    done
+    [ $DRY_RUN -eq 0 ] && echo_b "Removed desired modules with $errors error(s)"
+    ;;
+
+  info)
+    # Show information about specified module
+    module="$1"; shift
+    [ -z "$module" ] && fault "No module specified"
+
+    module_info "$module"
+    ;;
+
+  files)
+    # List deployed files of specified module
+    module="$1"; shift
+    [ -z "$module" ] && fault "No module specified"
+
+    require_module_dir "$module"
+
+    echo_b "Deployed files of '$module' module:"
+    sleep 1
+    module_dir="$MODGIT_DIR/$module"
+    cat "$module_dir/deployed.modgit"
+    ;;
+
+  proxy)
+    # Run git command into specified module
+    module="$1"; shift
+    [ -z "$module" ] && fault "No module specified"
+
+    require_module_dir "$module"
+
+    cd "$MODGIT_DIR/$module/source"
+
+    git "$@"
+    ;;
+
+  *)
+    show_help
+    echo_b "Invalid action: $ACTION"
+    exit 1
+
+esac
